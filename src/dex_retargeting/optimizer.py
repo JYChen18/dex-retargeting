@@ -575,3 +575,158 @@ class DexPilotOptimizer(Optimizer):
             return result
 
         return objective
+
+
+class AdaVectorOptimizer(Optimizer):
+    retargeting_type = "ADAVECTOR"
+
+    def __init__(
+        self,
+        robot: RobotWrapper,
+        target_joint_names: List[str],
+        target_origin_link_names: List[str],
+        target_task_link_names: List[str],
+        target_link_human_indices: np.ndarray,
+        huber_delta=0.02,
+        norm_delta=4e-3,
+        scaling=1.0,
+    ):
+        super().__init__(robot, target_joint_names, target_link_human_indices)
+        # self.origin_link_names = target_origin_link_names
+        # self.task_link_names = target_task_link_names
+        self.huber_loss = torch.nn.SmoothL1Loss(beta=huber_delta, reduction="mean")
+        self.norm_delta = norm_delta
+        self.scaling = scaling
+
+        # Computation cache for better performance
+        # For one link used in multiple vectors, e.g. hand palm, we do not want to compute it multiple times
+        joint_local = np.zeros((2, len(target_origin_link_names), 3))
+        self.update_target_link(
+            joint_local,
+            target_origin_link_names,
+            target_task_link_names,
+            len(target_task_link_names),
+        )
+
+        self.opt.set_ftol_abs(1e-6)
+
+    def update_target_link(
+        self,
+        pts_local: np.ndarray,
+        target_origin_link_names: List[str],
+        target_task_link_names: List[str],
+        num_vector: int,
+    ):
+        self.computed_link_names = list(
+            set(target_origin_link_names).union(set(target_task_link_names))
+        )
+        self.origin_link_indices = torch.tensor(
+            [self.computed_link_names.index(name) for name in target_origin_link_names]
+        )
+        self.task_link_indices = torch.tensor(
+            [self.computed_link_names.index(name) for name in target_task_link_names]
+        )
+
+        # Cache link indices that will involve in kinematics computation
+        self.computed_link_indices = self.get_link_indices(self.computed_link_names)
+        self.pts_local = torch.as_tensor(pts_local)
+        self.pts_local.requires_grad_(False)
+        self.num_vector = num_vector
+
+    def get_objective_function(
+        self, target_vector: np.ndarray, fixed_qpos: np.ndarray, last_qpos: np.ndarray
+    ):
+        qpos = np.zeros(self.num_joints)
+        qpos[self.idx_pin2fixed] = fixed_qpos
+        torch_target_vec = torch.as_tensor(target_vector) * self.scaling
+        torch_target_vec.requires_grad_(False)
+        exp_weight = torch.ones_like(torch_target_vec[:, 0])
+        exp_weight[self.num_vector :] = 10 * torch.exp(
+            -100 * torch.norm(torch_target_vec[self.num_vector :], dim=1, keepdim=False)
+        )
+        print(exp_weight.max(), exp_weight.min())
+
+        def objective(x: np.ndarray, grad: np.ndarray) -> float:
+            qpos[self.idx_pin2target] = x
+
+            # Kinematics forwarding for qpos
+            if self.adaptor is not None:
+                qpos[:] = self.adaptor.forward_qpos(qpos)[:]
+
+            self.robot.compute_forward_kinematics(qpos)
+            target_link_poses = [
+                self.robot.get_link_pose(index) for index in self.computed_link_indices
+            ]
+            body_pos = np.array([pose[:3, 3] for pose in target_link_poses])
+            body_rot = np.array([pose[:3, :3] for pose in target_link_poses])
+
+            # Torch computation for accurate loss and grad
+            torch_body_pos = torch.as_tensor(body_pos)
+            torch_body_pos.requires_grad_()
+            torch_body_rot = torch.as_tensor(body_rot)
+            torch_body_rot.requires_grad_()
+
+            # Index link for computation
+            origin_link_pos = torch_body_pos[
+                self.origin_link_indices, :
+            ] + torch.einsum(
+                "nij,nj->ni",
+                torch_body_rot[self.origin_link_indices],
+                self.pts_local[0],
+            )
+            task_link_pos = torch_body_pos[self.task_link_indices, :] + torch.einsum(
+                "nij,nj->ni", torch_body_rot[self.task_link_indices], self.pts_local[1]
+            )
+            robot_vec = task_link_pos - origin_link_pos
+
+            # Loss term for kinematics retargeting based on 3D position error
+            vec_dist = exp_weight * torch.norm(
+                robot_vec - torch_target_vec, dim=1, keepdim=False
+            )
+            huber_distance = self.huber_loss(vec_dist, torch.zeros_like(vec_dist))
+            result = huber_distance.cpu().detach().item()
+
+            if grad.size > 0:
+                jacobians = []
+                for i, index in enumerate(self.computed_link_indices):
+                    jacobians.append(
+                        self.robot.compute_single_link_local_jacobian(qpos, index)
+                    )
+
+                # Note: the joint order in this jacobian is consistent pinocchio
+                jacobians = np.stack(jacobians, axis=0)
+                jacobians = np.concatenate(
+                    [body_rot @ jacobians[:, :3], body_rot @ jacobians[:, 3:]], axis=1
+                )
+
+                huber_distance.backward()
+                grad_pos = torch_body_pos.grad.cpu().numpy()[:, None, :]
+                grad_rot = torch_body_rot.grad.cpu().numpy()
+
+                A = body_rot @ grad_rot.transpose(0, -1, -2)
+                tau_rot = np.stack(
+                    [
+                        A[:, 1, 2] - A[:, 2, 1],
+                        A[:, 2, 0] - A[:, 0, 2],
+                        A[:, 0, 1] - A[:, 1, 0],
+                    ],
+                    axis=-1,
+                )[:, None]
+
+                # Convert the jacobian from pinocchio order to target order
+                if self.adaptor is not None:
+                    jacobians = self.adaptor.backward_jacobian(jacobians)
+                else:
+                    jacobians = jacobians[..., self.idx_pin2target]
+
+                grad_qpos = np.matmul(
+                    np.concatenate([grad_pos, tau_rot], axis=-1), np.array(jacobians)
+                )
+                grad_qpos = grad_qpos.mean(1).sum(0)
+                grad_qpos += 2 * self.norm_delta * (x - last_qpos)
+
+                grad[:] = grad_qpos[:]
+
+            return result
+
+        return objective
