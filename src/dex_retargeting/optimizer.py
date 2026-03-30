@@ -107,6 +107,10 @@ class Optimizer:
     ):
         pass
 
+    @abstractmethod
+    def get_abs_keypoints(self, qpos: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        pass
+
     @property
     def fixed_joint_names(self):
         joint_names = self.robot.dof_joint_names
@@ -198,6 +202,14 @@ class PositionOptimizer(Optimizer):
             return result
 
         return objective
+
+    def get_abs_keypoints(self, qpos: np.ndarray):
+        self.robot.compute_forward_kinematics(qpos)
+        all_link_poses = [
+            self.robot.get_link_pose(index) for index in self.target_link_indices
+        ]
+        body_pos = np.stack([pose[:3, 3] for pose in all_link_poses], axis=0)  # (n ,3)
+        return None, body_pos
 
 
 class VectorOptimizer(Optimizer):
@@ -304,6 +316,17 @@ class VectorOptimizer(Optimizer):
             return result
 
         return objective
+
+    def get_abs_keypoints(self, qpos: np.ndarray):
+        self.robot.compute_forward_kinematics(qpos)
+        all_link_poses = [
+            self.robot.get_link_pose(index) for index in self.computed_link_indices
+        ]
+        body_pos = np.stack([pose[:3, 3] for pose in all_link_poses], axis=0)  # (n ,3)
+        return (
+            body_pos[self.origin_link_indices, :],
+            body_pos[self.task_link_indices, :],
+        )
 
 
 class DexPilotOptimizer(Optimizer):
@@ -576,6 +599,17 @@ class DexPilotOptimizer(Optimizer):
 
         return objective
 
+    def get_abs_keypoints(self, qpos: np.ndarray):
+        self.robot.compute_forward_kinematics(qpos)
+        all_link_poses = [
+            self.robot.get_link_pose(index) for index in self.computed_link_indices
+        ]
+        body_pos = np.stack([pose[:3, 3] for pose in all_link_poses], axis=0)  # (n ,3)
+        return (
+            body_pos[self.origin_link_indices, :],
+            body_pos[self.task_link_indices, :],
+        )
+
 
 class AdaVectorOptimizer(Optimizer):
     retargeting_type = "ADAVECTOR"
@@ -730,3 +764,20 @@ class AdaVectorOptimizer(Optimizer):
             return result
 
         return objective
+
+    def get_abs_keypoints(self, qpos: np.ndarray):
+        self.robot.compute_forward_kinematics(qpos)
+        all_link_poses = [
+            self.robot.get_link_pose(index) for index in self.computed_link_indices
+        ]
+        body_pos = np.stack([pose[:3, 3] for pose in all_link_poses], axis=0)  # (n ,3)
+        body_rot = np.stack([pose[:3, :3] for pose in all_link_poses], axis=0)
+        origin_link_pos = body_pos[self.origin_link_indices, :] + np.einsum(
+            "nij,nj->ni",
+            body_rot[self.origin_link_indices],
+            self.pts_local[0],
+        )
+        task_link_pos = body_pos[self.task_link_indices, :] + np.einsum(
+            "nij,nj->ni", body_rot[self.task_link_indices], self.pts_local[1]
+        )
+        return origin_link_pos, task_link_pos
